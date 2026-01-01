@@ -6,15 +6,14 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from accounts import ACCOUNTS
 
-# ---------------- RENDER FREE TIER FIX ---------------- #
-
+# ---------------- RENDER HEALTH CHECK ---------------- #
+# This satisfies Render's requirement for a web service to listen on a port.
 def run_health_server():
-    """Starts a simple server to satisfy Render's health check."""
     class HealthHandler(http.server.SimpleHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"Bot is running")
+            self.wfile.write(b"Bot is alive")
 
     server_address = ('0.0.0.0', 10000)
     httpd = http.server.HTTPServer(server_address, HealthHandler)
@@ -22,35 +21,27 @@ def run_health_server():
     httpd.serve_forever()
 
 # ---------------- CONFIG & CONSTANTS ---------------- #
-
 REQUEST_TIMEOUT = 30
 SALT = "j8n5HxYA0ZVF"
 ENCRYPTION_KEY = "6fbJwIfT6ibAkZo1VVKlKVl8M2Vb7GSs"
-
 FAIRBID_BURST = 50      
 FAIRBID_DELAY = 0  
 
 # ---------------- LOG ---------------- #
-
 def log(msg, name=None):
     prefix = f"[{name}] " if name else ""
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {prefix}{msg}", flush=True)
 
 # ---------------- CLIENT ---------------- #
-
 async def create_client():
     return httpx.AsyncClient(
         http2=True,
         timeout=httpx.Timeout(REQUEST_TIMEOUT),
-        limits=httpx.Limits(
-            max_connections=100,
-            max_keepalive_connections=50
-        ),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
         headers={"User-Agent": "Mozilla/5.0 (Android)"}
     )
 
 # ---------------- CONFIG ---------------- #
-
 async def load_config(client, url):
     r = await client.get(url)
     r.raise_for_status()
@@ -61,7 +52,6 @@ async def load_config(client, url):
     }
 
 # ---------------- AUTH ---------------- #
-
 async def get_id_token(client, firebase_key, refresh_token):
     r = await client.post(
         f"https://securetoken.googleapis.com/v1/token?key={firebase_key}",
@@ -82,14 +72,11 @@ class TokenManager:
 
     async def get(self, client):
         if not self.token or time.time() >= self.expiry:
-            self.token, self.uid, ttl = await get_id_token(
-                client, self.firebase_key, self.refresh_token
-            )
+            self.token, self.uid, ttl = await get_id_token(client, self.firebase_key, self.refresh_token)
             self.expiry = time.time() + ttl - 30
         return self.token, self.uid
 
 # ---------------- HASH ---------------- #
-
 _last_ts = 0
 def build_hash_payload(user_id, url):
     global _last_ts
@@ -106,7 +93,6 @@ def build_hash_payload(user_id, url):
     }, separators=(",", ":"))
 
 # ---------------- ENCRYPT ---------------- #
-
 def encrypt_offer(offer_id):
     key = hashlib.sha256(ENCRYPTION_KEY.encode()).digest()
     raw = json.dumps({"offerId": offer_id}, separators=(",", ":")).encode()
@@ -114,7 +100,6 @@ def encrypt_offer(offer_id):
     return {"data": {"data": base64.b64encode(enc).decode()}}
 
 # ---------------- FIRESTORE ---------------- #
-
 async def get_super_offer(client, token, project_id, uid):
     r = await client.post(
         f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents/users/{uid}:runQuery",
@@ -149,33 +134,25 @@ async def get_boosts(client, token, project_id, uid):
     )
     return int(r.json().get("fields", {}).get("boosts", {}).get("integerValue", 0))
 
-# ---------------- FAIRBID (FAST) ---------------- #
-
+# ---------------- FAIRBID ---------------- #
 async def run_fairbid(client, acc, cfg):
     try:
-        r = await client.post(
-            f"{acc['BASE_URL']}?spotId={acc['SPOT_ID']}",
-            content=cfg["payload"]
-        )
+        r = await client.post(f"{acc['BASE_URL']}?spotId={acc['SPOT_ID']}", content=cfg["payload"])
         t = r.text
         tasks = []
-
         if 'impression":"' in t:
             imp = t.split('impression":"')[1].split('"')[0]
             tasks.append(client.get(imp))
-
         if 'completion":"' in t:
             url = t.split('completion":"')[1].split('"')[0]
             payload = build_hash_payload(cfg["user_id"], url)
             tasks.append(client.post(url, content=payload))
-
         if tasks:
             await asyncio.gather(*tasks)
-    except Exception as e:
-        log(f"FairBid Error: {e}", acc["NAME"])
+    except Exception:
+        pass
 
 # ---------------- FUNCTIONS ---------------- #
-
 async def call_fn(client, token, project_id, name, offer_id):
     r = await client.post(
         f"https://us-central1-{project_id}.cloudfunctions.net/{name}",
@@ -185,67 +162,44 @@ async def call_fn(client, token, project_id, name, offer_id):
     return r.json()
 
 # ---------------- BOT LOOP ---------------- #
-
 async def bot_loop(acc):
     client = await create_client()
     try:
         cfg = await load_config(client, acc["JSON_URL"])
         tm = TokenManager(acc["FIREBASE_KEY"], acc["REFRESH_TOKEN"])
-
         log("STARTED", acc["NAME"])
-
         while True:
             try:
                 token, uid = await tm.get(client)
-
                 offer = await get_super_offer(client, token, acc["PROJECT_ID"], uid)
                 if not offer:
                     await asyncio.sleep(10)
                     continue
-
                 log(f"OFFER FOUND | ID={offer['offerId']} | FEES={offer['fees']}", acc["NAME"])
                 target = offer["fees"] + 1
-
                 while True:
                     boosts = await get_boosts(client, token, acc["PROJECT_ID"], uid)
                     log(f"BOOSTS {boosts}/{target}", acc["NAME"])
-
-                    if boosts >= target:
-                        break
-
-                    log("Running FairBid burst...", acc["NAME"])
-                    await asyncio.gather(
-                        *(run_fairbid(client, acc, cfg) for _ in range(FAIRBID_BURST))
-                    )
+                    if boosts >= target: break
+                    await asyncio.gather(*(run_fairbid(client, acc, cfg) for _ in range(FAIRBID_BURST)))
                     await asyncio.sleep(FAIRBID_DELAY)
-
-                unlock = await call_fn(client, token, acc["PROJECT_ID"], "superOffer_unlock", offer["offerId"])
-                log(f"UNLOCK RESPONSE: {unlock}", acc["NAME"])
-
-                claim = await call_fn(client, token, acc["PROJECT_ID"], "superOffer_claim", offer["offerId"])
-                log(f"CLAIM RESPONSE: {claim}", acc["NAME"])
-
+                await call_fn(client, token, acc["PROJECT_ID"], "superOffer_unlock", offer["offerId"])
+                await call_fn(client, token, acc["PROJECT_ID"], "superOffer_claim", offer["offerId"])
                 await asyncio.sleep(5)
             except Exception as e:
-                log(f"Loop error: {e}", acc["NAME"])
+                log(f"Error: {e}", acc["NAME"])
                 await asyncio.sleep(10)
-
     finally:
         await client.aclose()
 
 # ---------------- MAIN ---------------- #
-
 async def main():
     log("Royal Cash Bot - Multi Account Starting")
-    
-    # 1. Start the health check server in a background thread for Render
+    # Start the web server for Render health checks
     threading.Thread(target=run_health_server, daemon=True).start()
-    
-    # 2. Run the bot accounts
+    # Start the accounts
     await asyncio.gather(*(bot_loop(a) for a in ACCOUNTS))
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
+                
